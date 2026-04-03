@@ -154,7 +154,130 @@ MASTER_REGISTRY = {
 }
 
 # ==========================================================
-# 3. FIELD LOOKUP
+# 3. FIELD NAME MAPPING (Extractor → Master Registry)
+# ==========================================================
+EXTRACTED_TO_REGISTRY_MAPPING = {
+    # Total Quantity aliases
+    'total_quantity': 'Total Quantity',
+    'qty': 'Total Quantity',
+    'total_qty': 'Total Quantity',
+    'quantity': 'Total Quantity',
+    'total_items': 'Total Quantity',
+    'items': 'Total Quantity',
+    
+    # Shipper aliases
+    'shipper': 'Shipper Name & Address',
+    'shippername': 'Shipper Name & Address',
+    'shipper_name': 'Shipper Name & Address',
+    'shipper_address': 'Shipper Name & Address',
+    'bill_from': 'Shipper Name & Address',
+    'seller': 'Shipper Name & Address',
+    'vendor': 'Shipper Name & Address',
+    'exporter': 'Shipper Name & Address',
+    'exportername': 'Shipper Name & Address',
+    'exporter_name': 'Shipper Name & Address',
+    
+    # Consignee aliases
+    'consignee': 'Consignee Name & Address',
+    'consigneename': 'Consignee Name & Address',
+    'consignee_name': 'Consignee Name & Address',
+    'consignee_address': 'Consignee Name & Address',
+    'bill_to': 'Consignee Name & Address',
+    'buyer': 'Consignee Name & Address',
+    'importer': 'Consignee Name & Address',
+    'importername': 'Consignee Name & Address',
+    'importer_name': 'Consignee Name & Address',
+    
+    # Total Gross Weight aliases
+    'total_weight': 'Total Gross Weight',
+    'gross_weight': 'Total Gross Weight',
+    'total_gross_weight': 'Total Gross Weight',
+    'weight': 'Total Gross Weight',
+    'wgt': 'Total Gross Weight',
+    'total_wgt': 'Total Gross Weight',
+    
+    # Declared Value aliases
+    'total_amount': 'Declared Value (Total)',
+    'total_value': 'Declared Value (Total)',
+    'declared_value': 'Declared Value (Total)',
+    'customs_value': 'Declared Value (Total)',
+    'amount': 'Declared Value (Total)',
+    'total': 'Declared Value (Total)',
+    'grand_total': 'Declared Value (Total)',
+    
+    # Incoterms
+    'incoterms': 'Incoterms',
+    'inco_terms': 'Incoterms',
+    'incoterm': 'Incoterms',
+    'terms': 'Incoterms',
+    'terms_of_trade': 'Incoterms',
+    
+    # Port of Loading
+    'port_of_loading': 'Port of Loading',
+    'port_loading': 'Port of Loading',
+    'loading_port': 'Port of Loading',
+    'port_load': 'Port of Loading',
+    'portofloading': 'Port of Loading',
+    'shipmentport': 'Port of Loading',
+    'origin_port': 'Port of Loading',
+    
+    # Port of Discharge
+    'port_of_discharge': 'Port of Discharge',
+    'port_discharge': 'Port of Discharge',
+    'discharge_port': 'Port of Discharge',
+    'portofdischarge': 'Port of Discharge',
+    'destination_port': 'Port of Discharge',
+    'discharge': 'Port of Discharge',
+    
+    # HS Code
+    'hs_code': 'HS Code',
+    'hs': 'HS Code',
+    'hscode': 'HS Code',
+    'tariff_code': 'HS Code',
+    'tariffcode': 'HS Code',
+    'harmonized_code': 'HS Code',
+    'h_s_code': 'HS Code',
+    
+    # Country of Origin
+    'country_of_origin': 'Country of Origin',
+    'country_origin': 'Country of Origin',
+    'countryoforigin': 'Country of Origin',
+    'origin': 'Country of Origin',
+    'manufactured_in': 'Country of Origin',
+    'country': 'Country of Origin',
+}
+
+def map_extracted_to_registry(extracted_field_name: str) -> str:
+    """
+    Map extracted field names to MASTER_REGISTRY field names.
+    Returns the mapped name or the original if no mapping found.
+    """
+    normalized = extracted_field_name.lower().strip()
+    return EXTRACTED_TO_REGISTRY_MAPPING.get(normalized, extracted_field_name)
+
+def normalize_document_fields(documents: list) -> list:
+    """
+    Normalize field names in a list of documents by mapping them
+    to MASTER_REGISTRY field names.
+    """
+    normalized_docs = []
+    for doc in documents:
+        normalized_doc = doc.copy()
+        normalized_fields = {}
+        for extracted_name, value in doc.get("fields", {}).items():
+            registry_name = map_extracted_to_registry(extracted_name)
+            normalized_fields[registry_name] = value
+        normalized_doc["fields"] = normalized_fields
+        normalized_docs.append(normalized_doc)
+        # DEBUG: Log normalized fields
+        print(f"[NORMALIZE] {doc.get('filename', 'unknown')} — fields: {list(normalized_fields.keys())}")
+        for fname, fval in normalized_fields.items():
+            if fval:
+                print(f"  {fname}: {fval}")
+    return normalized_docs
+
+# ==========================================================
+# 4. FIELD LOOKUP
 # ==========================================================
 def get_field_matrix_info(field_name: str, registry: dict) -> dict | None:
     if field_name in registry:
@@ -202,6 +325,84 @@ def build_field_context(target_field: str, documents: list, registry: dict) -> d
 
 
 # ==========================================================
+# 5.5 LOCAL INCONSISTENCY DETECTION (before Gemini)
+# ==========================================================
+def check_local_inconsistencies(target_field: str, documents: list, registry: dict) -> dict | None:
+    """
+    Perform local inconsistency checks without Gemini.
+    Returns a result dict if issues found, None otherwise.
+    """
+    context = build_field_context(target_field, documents, registry)
+    if "error" in context:
+        return None
+    
+    doc_values = context["doc_values"]
+    
+    # Extract actual values
+    values_by_doc = {}
+    missing_docs = []
+    present_docs = []
+    
+    for dv in doc_values:
+        doc_type = dv["doc_type"]
+        value = dv["value"]
+        values_by_doc[doc_type] = value
+        
+        if value is None or value == '':
+            missing_docs.append((doc_type, dv["mandatory_level"]))
+        else:
+            present_docs.append((doc_type, value))
+    
+    issues = []
+    
+    # Check 1: PRESENCE_VIOLATIONS - Mandatory field missing
+    for doc_type, mandatory_level in missing_docs:
+        if mandatory_level == "mandatory":
+            issues.append({
+                "type": "PRESENCE_VIOLATION",
+                "severity": "CRITICAL",
+                "documents_involved": [doc_type],
+                "details": f"Mandatory field '{target_field}' is missing in {doc_type}",
+                "values": {doc_type: None},
+                "recommendation": f"Add '{target_field}' to the {doc_type} document."
+            })
+    
+    # Check 2: VALUE_MISMATCH - Different values in different documents
+    unique_values = set()
+    for doc_type, value in present_docs:
+        # Normalize for comparison
+        val_str = str(value).lower().strip() if value else ""
+        unique_values.add(val_str)
+    
+    if len(unique_values) > 1 and len(present_docs) >= 2:
+        # We have multiple different values
+        values_dict = {doc_type: str(val) for doc_type, val in present_docs}
+        issues.append({
+            "type": "VALUE_MISMATCH",
+            "severity": "HIGH" if len(unique_values) == 2 else "CRITICAL",
+            "documents_involved": [doc_type for doc_type, _ in present_docs],
+            "details": f"Field '{target_field}' has inconsistent values across documents: {', '.join(unique_values)}",
+            "values": values_dict,
+            "recommendation": f"Ensure all documents have matching '{target_field}' values. Verify which is correct."
+        })
+    
+    if issues:
+        return {
+            "field": target_field,
+            "base_risk_weight": context["base_risk_weight"],
+            "overall_severity": max([i["severity"] for i in issues], key=lambda x: {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}.get(x, -1)),
+            "inconsistencies_found": True,
+            "summary": f"Found {len(issues)} inconsistency/inconsistencies in field '{target_field}'",
+            "issues": issues,
+            "compliant_documents": [d["doc_type"] for d in doc_values if d["value"] is not None and d["value"] != ''],
+            "matrix_coverage_note": f"Field appears in {len([dv for dv in doc_values if dv['matrix_expected']])} of {len(doc_values)} documents",
+            "_local_analysis": True
+        }
+    
+    return None
+
+
+# ==========================================================
 # 5. JSON CLEANING HELPER
 # ==========================================================
 def _clean_json_response(raw: str) -> str:
@@ -220,6 +421,13 @@ def _clean_json_response(raw: str) -> str:
 # 6. SINGLE-FIELD ANALYSIS (calls Gemini)
 # ==========================================================
 def analyze_inconsistencies(target_field: str, documents: list, registry: dict) -> dict:
+    # First try local analysis
+    local_result = check_local_inconsistencies(target_field, documents, registry)
+    if local_result:
+        print(f"[LOCAL] {target_field}: Found {len(local_result['issues'])} issues locally")
+        return local_result
+    
+    # If local analysis found nothing, try Gemini
     context = build_field_context(target_field, documents, registry)
     if "error" in context:
         return context
@@ -227,19 +435,26 @@ def analyze_inconsistencies(target_field: str, documents: list, registry: dict) 
     model = genai.GenerativeModel(GEMINI_MODEL)
 
     prompt = f"""
-You are a trade document compliance expert. Find VALUE INCONSISTENCIES for a specific
-field across multiple shipping documents belonging to the same shipment.
+You are a trade document compliance expert. Find VALUE INCONSISTENCIES, MISSING MANDATORY FIELDS, and compliance issues for a specific field across multiple shipping documents.
 
 === FIELD UNDER ANALYSIS ===
-Field Name      : {context['target_field']}
-Base Risk Weight: {context['base_risk_weight']} / 10
-Matrix says field appears in: {", ".join(context['appearing_in']) if context['appearing_in'] else "Not specified"}
+Field Name       : {context['target_field']}
+Base Risk Weight : {context['base_risk_weight']} / 10
+Expected In      : {", ".join(context['appearing_in']) if context['appearing_in'] else "Not specified"}
 
 === FIELD VALUES EXTRACTED FROM EACH DOCUMENT ===
 {json.dumps(context['doc_values'], indent=2)}
 
 === YOUR TASK ===
-Identify: VALUE MISMATCHES, PRESENCE VIOLATIONS, SEMANTIC MISMATCHES, RISK ASSESSMENT.
+Check each document and find:
+1. VALUE MISMATCHES between documents (same field, different values)
+2. PRESENCE VIOLATIONS (field marked as mandatory but missing/null in a document)
+3. SEMANTIC MISMATCHES (values that don't match logically even if formatted differently)
+4. MISSING MANDATORY FIELDS (when matrix shows field is mandatory but value is null)
+
+Return inconsistencies_found: true if ANY of the above are present.
+If all values are null/missing AND none are mandatory, return false.
+If all values are identical and present, return false.
 
 === MANDATORY OUTPUT FORMAT (JSON ONLY - no markdown, no extra text) ===
 {{
@@ -268,21 +483,30 @@ Identify: VALUE MISMATCHES, PRESENCE VIOLATIONS, SEMANTIC MISMATCHES, RISK ASSES
 
     raw_text = ""
     try:
+        print(f"[GEMINI] Analyzing {target_field} with {len(context['doc_values'])} documents...")
         response = model.generate_content(prompt)
         raw_text = response.text
         cleaned = _clean_json_response(raw_text)
         result = json.loads(cleaned)
         result["_matrix_context"] = context
+        has_issues = result.get("inconsistencies_found", False)
+        severity = result.get("overall_severity", "UNKNOWN")
+        print(f"[GEMINI] {target_field}: inconsistencies={has_issues}, severity={severity}")
         return result
 
     except json.JSONDecodeError as e:
-        return {
+        error_result = {
             "error": "Gemini returned non-JSON output",
-            "raw_response": raw_text,
+            "raw_response": raw_text[:500],
             "parse_error": str(e),
+            "inconsistencies_found": False,
         }
+        print(f"[GEMINI ERROR] {target_field}: JSON parse error - {raw_text[:200]}")
+        return error_result
     except Exception as e:
-        return {"error": "API call failed", "details": str(e)}
+        error_result = {"error": "API call failed", "details": str(e), "inconsistencies_found": False}
+        print(f"[GEMINI ERROR] {target_field}: API error - {str(e)}")
+        return error_result
 
 
 # ==========================================================
@@ -298,23 +522,51 @@ def analyze_all_cross_doc_fields(documents: list, registry: dict) -> dict:
 
     Returns a dict keyed by field name with Gemini analysis results.
     """
+    # Normalize field names from extracted fields to registry names
+    normalized_documents = normalize_document_fields(documents)
+    
     present_fields: set = set()
-    for doc in documents:
+    for doc in normalized_documents:
         present_fields.update(doc["fields"].keys())
+    
+    print(f"[ANALYZE] Present fields in documents: {present_fields}")
 
     results = {}
+    checked_count = 0
+    skipped_count = 0
+    
     for field_name, meta in registry.items():
         if not meta.get("llm_call"):
+            skipped_count += 1
             continue
         expected_in = [dt for dt, info in meta["doc_types"].items() if info["present"]]
         if len(expected_in) < 2:
+            skipped_count += 1
+            print(f"[SKIP] {field_name}: only in {len(expected_in)} doc types (need 2+)")
             continue
         if field_name not in present_fields:
+            skipped_count += 1
+            print(f"[SKIP] {field_name}: not present in extracted fields")
+            continue
+        
+        # Check if field has any non-null values across documents
+        has_any_value = False
+        for doc in normalized_documents:
+            val = doc["fields"].get(field_name)
+            if val is not None and val != '':
+                has_any_value = True
+                break
+        
+        if not has_any_value:
+            skipped_count += 1
+            print(f"[SKIP] {field_name}: no non-null values found in any document")
             continue
 
-        print(f"  -> Checking: {field_name} (risk={meta['base_risk_weight']})")
-        results[field_name] = analyze_inconsistencies(field_name, documents, registry)
+        print(f"[CHECK] {field_name} (risk={meta['base_risk_weight']})")
+        results[field_name] = analyze_inconsistencies(field_name, normalized_documents, registry)
+        checked_count += 1
 
+    print(f"[ANALYZE SUMMARY] Checked: {checked_count}, Skipped: {skipped_count}, Total: {checked_count + skipped_count}")
     return results
 
 
