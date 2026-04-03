@@ -1,9 +1,11 @@
 # Quinto Document Hub
 ### AI-Powered Trade Document Validation
 
-Quinto is a full-stack, AI-driven application that automates the classification, extraction, and cross-validation of international trade shipping documents.
+Quinto is a full-stack, AI-driven application designed to automate the classification, extraction, and cross-validation of international trade shipping documents.
 
-It leverages:
+## Overview
+
+Quinto leverages:
 - Tesseract OCR  
 - Regex-based heuristic extraction  
 - Google Gemini LLM  
@@ -42,7 +44,7 @@ Extracts:
 Using targeted regex patterns.
 
 ### 🤖 Cross-Document AI Validation
-- Powered by **Gemini 1.5 Flash**  
+- Powered by **Gemini 1.5 Flash**
 - Detects:
   - Value mismatches  
   - Semantic inconsistencies  
@@ -75,7 +77,8 @@ Using targeted regex patterns.
 ### System Dependencies
 
 #### 1. Poppler (required for `pdf2image`)
-- **Mac (Homebrew):**
+
+- **macOS (Homebrew):**
   ```bash
   brew install poppler
   ```
@@ -84,11 +87,12 @@ Using targeted regex patterns.
   sudo apt-get install poppler-utils
   ```
 - **Windows:**
-  - Download Poppler binaries  
-  - Add to system PATH  
+  - Download Poppler binaries
+  - Add them to your system PATH
 
 #### 2. Tesseract OCR (required for `pytesseract`)
-- **Mac (Homebrew):**
+
+- **macOS (Homebrew):**
   ```bash
   brew install tesseract
   ```
@@ -97,72 +101,90 @@ Using targeted regex patterns.
   sudo apt-get install tesseract-ocr
   ```
 - **Windows:**
-  - Install Tesseract  
-  - Add to system PATH  
+  - Install Tesseract OCR
+  - Add it to your system PATH
 
 ---
 
 ## 🚀 Installation & Setup
 
-### 1. Clone the repository
+### 1. Clone the Repository
 ```bash
 cd /path/to/your/quinto/repo
 ```
 
-### 2. Install Python dependencies (critical)
+### 2. Install Python Dependencies
 ```bash
 pip install fastapi uvicorn python-multipart pytesseract pdf2image pillow google-generativeai
 ```
 
-### 3. Configure Gemini API key
-- The key is currently hardcoded in `field_checker.py`
-- Replace:
-  ```python
-  API_KEY = "..."
-  ```
-- Recommended (production):
-  - Use environment variables instead  
+### 3. Configure Gemini API Key
+A sample API key has already been hardcoded in `field_checker.py` for quick testing and evaluation. 
+You may replace it if needed:
+```python
+API_KEY = "YOUR_API_KEY"
+```
+
+**Recommended (Production):**
+- Use environment variables instead of hardcoding
 
 ---
 
 ## 💻 Running the Application
 
-### 1. Start the FastAPI server
+### 1. Start the FastAPI Server
 ```bash
 python main_input.py
 ```
-
 **Alternative (Uvicorn):**
 ```bash
 uvicorn main_input:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 2. Open the web interface
-```
+### 2. Open the Web Interface
+```text
 http://localhost:8000
 ```
-
 Upload sample trade PDFs to test the pipeline.
+
+---
+
+## 📂 Sample Testing Data (For Judges & Evaluators)
+
+Sample PDFs are included in the repository to demonstrate system capabilities across two testing scenarios.
+
+### Scenario 1: Value Inconsistencies
+Documents contain all required fields but include intentional conflicts to test discrepancy detection:
+- `Certificate_of_origin.pdf`
+- `Commercial_Invoice.pdf`
+- `Customs_Declaration.pdf`
+- `Packing_List.pdf`
+
+### Scenario 2: Missing Fields
+Documents are intentionally incomplete to test missing field detection:
+- `Bill_of_Lading.pdf`
+- `Customs_Declaration_Missing.pdf`
+- `Commercial_Invoice_Missing.pdf`
+- `Certificate_of_Origin_Missing.pdf`
+- `Shipper_Name_Missing.pdf`
 
 ---
 
 ## 🛠️ Standalone Testing
 
-Run validation logic without the web server:
+Run validation logic without starting the web server:
 
 ```bash
-# Single-field check
+# Single-field validation
 python field_checker.py
 
-# Full batch cross-document check
+# Full cross-document validation
 python field_checker.py --all
 ```
 
 ---
 
 ## 📌 Notes
-- Ensure Poppler and Tesseract are correctly added to PATH  
-- OCR accuracy depends on document quality  
-- Gemini API usage may incur costs  
-
----
+- Ensure Poppler and Tesseract are correctly added to PATH
+- OCR accuracy depends on document quality
+- Gemini API usage may incur costs
