@@ -1,225 +1,417 @@
-<!DOCTYPE html>
-<html lang="en">
+"""
+Quinto — FastAPI Backend
+Full pipeline: PDF upload → OCR → extraction → cross-doc field checking → output.html
+"""
 
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Quinto — Document Hub</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.3/dist/cdn.min.js"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700;900&display=swap" rel="stylesheet" />
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    fontFamily: { sans: ['Montserrat', 'system-ui', 'sans-serif'] },
-                },
-            },
-        };
-    </script>
-    <style>
-        [x-cloak] {
-            display: none !important;
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import tempfile, os, logging, json, uuid
+from typing import List, Dict, Any
+from datetime import datetime
+from pathlib import Path
+
+# ── Local modules ──────────────────────────────────────────────────────────────
+from ocr_engine import OCREngine, get_ocr_engine
+from extractor import DocumentExtractor, get_extractor, ExtractionResult
+from field_checker import analyze_all_cross_doc_fields, MASTER_REGISTRY, print_report
+
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ── App ────────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Quinto Document Validation API",
+    description="OCR → extraction → cross-doc inconsistency pipeline for trade documents",
+    version="2.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+# Serve the two HTML pages as static files if they live next to this script.
+# landingpage.html  →  /
+# output.html       →  /output.html
+STATIC_DIR = Path(__file__).parent
+if (STATIC_DIR / "landingpage.html").exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# ── Global singletons ──────────────────────────────────────────────────────────
+ocr_engine: OCREngine = None
+document_extractor: DocumentExtractor = None
+
+# In-memory store for validation results keyed by shipment_id
+validation_store: Dict[str, Any] = {}
+
+
+# ── Startup ────────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    global ocr_engine, document_extractor
+    logger.info("Initialising OCR Engine …")
+    ocr_engine = get_ocr_engine(dpi=300)
+    logger.info("Initialising Document Extractor …")
+    document_extractor = get_extractor()
+    logger.info("Quinto backend ready.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Quinto backend shutting down.")
+
+
+# ── Health ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+# ── Serve landing page ─────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def serve_landing():
+    """Serve landingpage.html at root."""
+    lp = STATIC_DIR / "landingpage.html"
+    if lp.exists():
+        return HTMLResponse(content=lp.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>landingpage.html not found next to main_input.py</h1>", status_code=404)
+
+
+# ── Serve output page ──────────────────────────────────────────────────────────
+@app.get("/output.html", response_class=HTMLResponse)
+async def serve_output():
+    """Serve output.html (static template — used before a real report is ready)."""
+    op = STATIC_DIR / "output.html"
+    if op.exists():
+        return HTMLResponse(content=op.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>output.html not found</h1>", status_code=404)
+
+
+# ==============================================================================
+# CORE ENDPOINT: /api/v1/validate-shipment
+# Accepts 1-5 PDF files, runs the full pipeline, returns structured report.
+# ==============================================================================
+
+@app.post("/api/v1/validate-shipment", tags=["Validation"])
+async def validate_shipment(
+    files: List[UploadFile] = File(...),
+    ocr_language: str = "eng",
+    enhance_preprocessing: bool = True
+):
+    """
+    Full Quinto pipeline:
+      1. Receive PDF files (up to 5 trade documents)
+      2. OCR each PDF  →  raw text per page
+      3. Classify + extract structured fields  (extractor.py)
+      4. Run cross-document field consistency checks  (field_checker.py)
+      5. Return JSON validation report + HTML-ready payload
+
+    The JSON response is everything output.html needs to render the report.
+    """
+    shipment_id = str(uuid.uuid4())[:8].upper()
+    logger.info(f"[{shipment_id}] Received {len(files)} file(s)")
+
+    temp_paths = []
+
+    try:
+        # ── Step 1 & 2: Save files → OCR ──────────────────────────────────────
+        ocr_results: Dict[str, Dict[int, str]] = {}   # filename → {page: text}
+
+        for upload in files:
+            if upload.content_type not in ("application/pdf", "application/octet-stream"):
+                raise HTTPException(400, f"'{upload.filename}' is not a PDF.")
+
+            tmp_path = os.path.join(tempfile.gettempdir(),
+                                    f"{shipment_id}_{upload.filename}")
+            contents = await upload.read()
+            if len(contents) > 50 * 1024 * 1024:
+                raise HTTPException(400, f"'{upload.filename}' exceeds 50 MB limit.")
+
+            with open(tmp_path, "wb") as f:
+                f.write(contents)
+            temp_paths.append(tmp_path)
+
+            logger.info(f"[{shipment_id}] OCR → {upload.filename}")
+            if enhance_preprocessing:
+                ocr_results[upload.filename] = ocr_engine.extract_text_enhanced(
+                    tmp_path, lang=ocr_language, preprocess=True)
+            else:
+                ocr_results[upload.filename] = ocr_engine.extract_text(
+                    tmp_path, lang=ocr_language)
+
+        # ── Step 3: Extract structured fields from each document ───────────────
+        # We collapse all pages of a document into one text blob per file,
+        # then classify + extract once per file.
+        extracted_documents = []   # list of dicts ready for field_checker.py
+
+        for filename, page_dict in ocr_results.items():
+            full_text = "\n".join(page_dict.values())
+            result: ExtractionResult = document_extractor.extract(full_text)
+
+            # Map extractor's DocumentType enum value → human-readable label
+            # used as "doc_type" key expected by field_checker's MASTER_REGISTRY
+            DOC_TYPE_MAP = {
+                "commercial_invoice":   "Commercial Invoice",
+                "packing_list":         "Packing List",
+                "bill_of_lading":       "Bill of Lading",
+                "certificate_of_origin":"Certificate of Origin",
+                "customs_declaration":  "Customs Declaration",
+                "unknown":              filename,   # fallback: use filename
+            }
+            doc_type_label = DOC_TYPE_MAP.get(result.document_type, filename)
+
+            extracted_documents.append({
+                "doc_type":  doc_type_label,
+                "filename":  filename,
+                "fields":    result.extracted_fields,
+                "confidence": result.confidence,
+                "quality_score": result.quality_score,
+                "warnings":  result.warnings,
+            })
+
+            logger.info(
+                f"[{shipment_id}] {filename} → {doc_type_label} "
+                f"(confidence={result.confidence:.2%}, fields={len(result.extracted_fields)})"
+            )
+            # DEBUG: Log what was actually extracted
+            for fname, fval in result.extracted_fields.items():
+                logger.info(f"  {fname} = {fval}")
+
+        # ── Step 4: Cross-document field consistency check (Gemini) ───────────
+        logger.info(f"[{shipment_id}] Running cross-doc field checks via Gemini …")
+        
+        # DEBUG: Log what's being sent to field_checker
+        logger.info(f"[{shipment_id}] Extracted Documents Summary:")
+        for i, doc in enumerate(extracted_documents):
+            logger.info(f"  Doc {i}: {doc['doc_type']} - {len(doc['fields'])} fields")
+            for fname, fval in doc['fields'].items():
+                logger.info(f"    {fname}: {fval}")
+        
+        field_check_results = analyze_all_cross_doc_fields(
+            extracted_documents, MASTER_REGISTRY
+        )
+        
+        # DEBUG: Log what came back
+        logger.info(f"[{shipment_id}] Field check results: {len(field_check_results)} fields analyzed")
+        for field_name, result in field_check_results.items():
+            has_issues = result.get("inconsistencies_found", False)
+            severity = result.get("overall_severity", "UNKNOWN")
+            issues_count = len(result.get("issues", []))
+            logger.info(f"  - {field_name}: inconsistencies={has_issues}, severity={severity}, issues={issues_count}")
+            if "error" in result:
+                logger.warning(f"    ERROR: {result['error']}")
+
+        # ── Step 5: Build unified report ──────────────────────────────────────
+        issues_flat = []
+        total_issues = 0
+        critical_count = 0
+
+        for field_name, check in field_check_results.items():
+            if check.get("inconsistencies_found"):
+                for issue in check.get("issues", []):
+                    total_issues += 1
+                    sev = issue.get("severity", "LOW")
+                    if sev == "CRITICAL":
+                        critical_count += 1
+                    issues_flat.append({
+                        "field":            field_name,
+                        "type":             issue.get("type"),
+                        "severity":         sev,
+                        "documents":        issue.get("documents_involved", []),
+                        "details":          issue.get("details"),
+                        "values":           issue.get("values", {}),
+                        "recommendation":   issue.get("recommendation"),
+                    })
+
+        # Compute a simple risk score (0-100)
+        sev_weights = {"CRITICAL": 20, "HIGH": 10, "MEDIUM": 5, "LOW": 2}
+        raw_score = sum(sev_weights.get(i["severity"], 0) for i in issues_flat)
+        risk_score = min(100, raw_score)
+
+        report = {
+            "shipment_id":       f"TRD-{datetime.now().year}-{shipment_id}",
+            "processed_at":      datetime.now().isoformat(),
+            "documents_received": len(extracted_documents),
+            "fields_checked":    len(field_check_results),
+            "total_issues":      total_issues,
+            "critical_issues":   critical_count,
+            "risk_score":        risk_score,
+            "extracted_documents": extracted_documents,
+            "field_check_results": field_check_results,
+            "issues":            issues_flat,
         }
 
-        html,
-        body {
-            height: 100%;
-            overflow: hidden;
-        }
+        # Store for later retrieval
+        validation_store[shipment_id] = report
 
-        body {
-            font-family: Montserrat, system-ui, sans-serif;
-        }
-    </style>
-</head>
+        logger.info(
+            f"[{shipment_id}] Done. risk_score={risk_score}, issues={total_issues}"
+        )
+        return JSONResponse(content=report, status_code=200)
 
-<body class="h-screen antialiased text-white" x-data="logisticsHub()">
+    except HTTPException:
+        raise
 
-    <div class="fixed inset-0 z-0 overflow-hidden" aria-hidden="true">
-        <div class="absolute inset-0 bg-cover bg-center bg-no-repeat opacity-40"
-            style="background-image: url('https://images.unsplash.com/photo-1605745341112-85968b19335b?auto=format&fit=crop&w=2400&q=85');">
-        </div>
-        <div class="absolute inset-0 bg-[#0d1024]/80 backdrop-blur-[1px]"></div>
-    </div>
+    except Exception as e:
+        logger.error(f"[{shipment_id}] Pipeline error: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"Pipeline error: {str(e)}")
 
-    <header class="fixed top-0 left-0 z-50 p-6">
-        <div class="flex items-center gap-3 border border-white/20 bg-white/5 px-4 py-2.5 backdrop-blur-md rounded-sm">
-            <svg class="w-7 h-7 text-blue-400" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <circle cx="50" cy="50" r="46" stroke="currentColor" stroke-width="8" stroke-dasharray="210 100" />
-                <path d="M72.2843 72.2843L90 90" stroke="currentColor" stroke-width="8" stroke-linecap="round" />
-                <rect x="35" y="30" width="22" height="22" rx="2" stroke="currentColor" stroke-width="6" />
-                <rect x="43" y="38" width="22" height="22" rx="2" fill="#0d1024" stroke="currentColor"
-                    stroke-width="6" />
-            </svg>
-            <div class="flex flex-col">
-                <span class="text-xl font-black text-white leading-none tracking-tight">QUINTO</span>
-                <span class="text-[8px] font-bold text-blue-400 uppercase tracking-widest leading-none">Validation
-                    AI</span>
-            </div>
-        </div>
-    </header>
+    finally:
+        # Always clean up temp files
+        for p in temp_paths:
+            if os.path.exists(p):
+                os.remove(p)
 
-    <div
-        class="relative z-10 flex h-screen w-full flex-col items-center justify-center overflow-hidden px-4 sm:px-6 pt-24 pb-12">
-        <div class="flex w-full max-w-5xl flex-col items-center gap-6">
 
-            <div class="flex flex-col items-center justify-center relative text-center">
-                <h1 class="text-3xl font-black uppercase leading-none tracking-tight text-white/70 md:text-4xl">
-                    Quinto Document Hub
-                </h1>
-                <p class="text-[10px] font-medium uppercase tracking-[0.2em] text-white/50 mt-1">Cross-Check & Validate
-                    Shipment Files</p>
-            </div>
+# ==============================================================================
+# CONVENIENCE: retrieve a stored report
+# ==============================================================================
 
-            <section class="w-full shrink-0">
-                <div class="flex flex-col items-stretch gap-4 lg:flex-row lg:items-center lg:justify-between">
-                    <div class="flex-1 border border-white/25 bg-white/10 p-3 backdrop-blur-md">
-                        <label class="block text-[9px] font-bold uppercase tracking-[0.2em] text-white/65">Country of
-                            Origin</label>
-                        <select x-model="origin"
-                            class="mt-2 w-full appearance-none border border-white/25 bg-[#1a1b41]/50 px-3 py-2 text-xs font-bold text-white outline-none backdrop-blur-sm transition focus:border-white/50">
-                            <template x-for="c in countries" :key="c">
-                                <option x-text="c" :value="c" class="bg-[#12152c]"></option>
-                            </template>
-                        </select>
-                    </div>
-                    <div class="flex items-center justify-center px-2 text-white">
-                        <svg class="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
-                            <path d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                        </svg>
-                    </div>
-                    <div class="flex-1 border border-white/25 bg-white/10 p-3 backdrop-blur-md">
-                        <label
-                            class="block text-[9px] font-bold uppercase tracking-[0.2em] text-white/65">Destination</label>
-                        <select x-model="destination"
-                            class="mt-2 w-full appearance-none border border-white/25 bg-[#1a1b41]/50 px-3 py-2 text-xs font-bold text-white outline-none backdrop-blur-sm transition focus:border-white/50">
-                            <template x-for="c in countries" :key="c">
-                                <option x-text="c" :value="c" class="bg-[#12152c]"></option>
-                            </template>
-                        </select>
-                    </div>
-                </div>
-            </section>
+@app.get("/api/v1/report/{shipment_id}", tags=["Results"])
+async def get_report(shipment_id: str):
+    """Retrieve a previously computed validation report by shipment ID."""
+    if shipment_id not in validation_store:
+        raise HTTPException(404, f"No report found for shipment ID: {shipment_id}")
+    return validation_store[shipment_id]
 
-            <main class="flex w-full flex-col gap-4">
-                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <template x-for="(doc, index) in documents.slice(0, 3)" :key="doc.id">
-                        <div class="relative group">
-                            <button x-show="doc.uploaded" @click.stop="doc.uploaded = false"
-                                class="absolute right-2 top-2 z-20 bg-red-500/80 hover:bg-red-600 text-white p-1 rounded transition duration-200">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24"
-                                    stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3"
-                                        d="M6 18L18 6M6 6l12 12" />
-                                </svg>
-                            </button>
-                            <button @click="markUploaded(index)"
-                                class="w-full relative flex min-h-[155px] flex-col items-center justify-center border p-4 text-center backdrop-blur-md transition duration-300"
-                                :class="doc.uploaded ? 'border-2 border-blue-400 bg-blue-950/55 shadow-[0_0_24px_rgba(96,165,250,0.25)]' : 'border-white/30 bg-[#1a1b41]/70 hover:bg-[#1a1b41]/85'">
-                                <span
-                                    class="absolute right-2 top-2 border border-white/30 bg-white/15 px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wider"
-                                    x-show="!doc.uploaded">Required</span>
-                                <div x-show="!doc.uploaded" class="flex flex-col items-center">
-                                    <span
-                                        class="mb-2 flex h-8 w-8 items-center justify-center border border-white/35 bg-white/10 text-xl font-light">+</span>
-                                    <span class="text-[10px] font-bold uppercase tracking-wide"
-                                        x-text="doc.label"></span>
-                                    <span
-                                        class="mt-2 text-[7px] font-black text-blue-400 uppercase tracking-widest border border-blue-400/30 px-2 py-0.5 bg-blue-400/5">.PDF
-                                        ONLY</span>
-                                </div>
-                                <div x-show="doc.uploaded" class="flex flex-col items-center gap-1">
-                                    <svg class="h-7 w-7 text-sky-200" fill="none" viewBox="0 0 24 24"
-                                        stroke="currentColor" stroke-width="2.25">
-                                        <path d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span class="text-[9px] font-black uppercase opacity-70">UPLOADED</span>
-                                    <span class="text-[8px] font-bold text-white/90" x-text="doc.label"></span>
-                                </div>
-                            </button>
-                        </div>
-                    </template>
-                </div>
 
-                <div class="flex flex-col md:flex-row justify-center gap-6">
-                    <template x-for="(doc, i) in documents.slice(3, 5)" :key="doc.id">
-                        <div class="relative group w-full md:w-1/3">
-                            <button x-show="doc.uploaded" @click.stop="doc.uploaded = false"
-                                class="absolute right-2 top-2 z-20 bg-red-500/80 hover:bg-red-600 text-white p-1 rounded transition duration-200">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24"
-                                    stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3"
-                                        d="M6 18L18 6M6 6l12 12" />
-                                </svg>
-                            </button>
-                            <button @click="markUploaded(3 + i)"
-                                class="w-full relative flex min-h-[155px] flex-col items-center justify-center border p-4 text-center backdrop-blur-md transition duration-300"
-                                :class="doc.uploaded ? 'border-2 border-blue-400 bg-blue-950/55 shadow-[0_0_24px_rgba(96,165,250,0.25)]' : 'border-white/30 bg-[#1a1b41]/70 hover:bg-[#1a1b41]/85'">
-                                <span
-                                    class="absolute right-2 top-2 border border-white/30 bg-white/15 px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wider"
-                                    x-show="!doc.uploaded">Required</span>
-                                <div x-show="!doc.uploaded" class="flex flex-col items-center">
-                                    <span
-                                        class="mb-2 flex h-8 w-8 items-center justify-center border border-white/35 bg-white/10 text-xl font-light">+</span>
-                                    <span class="text-[10px] font-bold uppercase tracking-wide"
-                                        x-text="doc.label"></span>
-                                    <span
-                                        class="mt-2 text-[7px] font-black text-blue-400 uppercase tracking-widest border border-blue-400/30 px-2 py-0.5 bg-blue-400/5">.PDF
-                                        ONLY</span>
-                                </div>
-                                <div x-show="doc.uploaded" class="flex flex-col items-center gap-1">
-                                    <svg class="h-7 w-7 text-sky-200" fill="none" viewBox="0 0 24 24"
-                                        stroke="currentColor" stroke-width="2.25">
-                                        <path d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span class="text-[9px] font-black uppercase opacity-70">UPLOADED</span>
-                                    <span class="text-[8px] font-bold text-white/90" x-text="doc.label"></span>
-                                </div>
-                            </button>
-                        </div>
-                    </template>
-                </div>
+@app.get("/api/v1/reports", tags=["Results"])
+async def list_reports():
+    """List all stored report IDs."""
+    return {
+        "total": len(validation_store),
+        "shipment_ids": list(validation_store.keys()),
+        "timestamp": datetime.now().isoformat(),
+    }
 
-                <div class="flex justify-center pt-4">
-                    <div x-cloak x-show="allUploaded" x-transition class="w-full max-w-sm">
-                        <button type="button" @click="startAnalysis()"
-                            class="w-full border border-blue-400/30 bg-blue-600/10 px-4 py-3 text-[10px] font-black uppercase tracking-[0.18em] transition hover:bg-blue-600/20 active:scale-95 shadow-[0_0_30px_rgba(37,99,235,0.2)] text-blue-300">
-                            <span x-text="loading ? 'PROCESSING MATRIX...' : 'GENERATE QUINTO REPORT'"></span>
-                        </button>
-                    </div>
-                </div>
-            </main>
-        </div>
-    </div>
 
-    <script>
-        function logisticsHub() {
-            return {
-                origin: 'United States of America',
-                destination: 'United Arab Emirates',
-                countries: ['United States of America', 'United Arab Emirates', 'United Kingdom', 'India', 'China'],
-                documents: [
-                    { id: 'ci', label: 'Commercial Invoice', uploaded: false },
-                    { id: 'pl', label: 'Packing List', uploaded: false },
-                    { id: 'bol', label: 'Bill of Lading', uploaded: false },
-                    { id: 'coo', label: 'Certificate of Origin', uploaded: false },
-                    { id: 'cd', label: 'Customs Declaration', uploaded: false },
-                ],
-                loading: false,
-                get allUploaded() { return this.documents.every(d => d.uploaded); },
-                markUploaded(index) { this.documents[index].uploaded = true; },
-                startAnalysis() {
-                    this.loading = true;
-                    setTimeout(() => {
-                        window.location.href = 'output.html';
-                    }, 1500);
-                }
-            };
-        }
-    </script>
-</body>
+# ==============================================================================
+# TEST ENDPOINT: Debug with sample data
+# ==============================================================================
 
-</html>
+@app.get("/api/v1/test-analysis", tags=["Testing"])
+async def test_analysis():
+    """Run analysis on sample documents to test if the system is working."""
+    shipment_id = "TEST-SAMPLE-001"
+    logger.info(f"[{shipment_id}] Running test analysis with sample data...")
+    
+    # Import sample documents
+    from field_checker import SAMPLE_DOCUMENTS
+    
+    # Run cross-document field checking
+    field_check_results = analyze_all_cross_doc_fields(
+        SAMPLE_DOCUMENTS, MASTER_REGISTRY
+    )
+    
+    logger.info(f"[{shipment_id}] Field check results: {len(field_check_results)} fields analyzed")
+
+    # Build issues flat
+    issues_flat = []
+    total_issues = 0
+    critical_count = 0
+
+    for field_name, check in field_check_results.items():
+        if check.get("inconsistencies_found"):
+            for issue in check.get("issues", []):
+                total_issues += 1
+                sev = issue.get("severity", "LOW")
+                if sev == "CRITICAL":
+                    critical_count += 1
+                issues_flat.append({
+                    "field":            field_name,
+                    "type":             issue.get("type"),
+                    "severity":         sev,
+                    "documents":        issue.get("documents_involved", []),
+                    "details":          issue.get("details"),
+                    "values":           issue.get("values", {}),
+                    "recommendation":   issue.get("recommendation"),
+                })
+
+    # Compute risk score
+    sev_weights = {"CRITICAL": 20, "HIGH": 10, "MEDIUM": 5, "LOW": 2}
+    raw_score = sum(sev_weights.get(i["severity"], 0) for i in issues_flat)
+    risk_score = min(100, raw_score)
+
+    report = {
+        "shipment_id":       f"TRD-TEST-{datetime.now().year}-{shipment_id}",
+        "processed_at":      datetime.now().isoformat(),
+        "documents_received": len(SAMPLE_DOCUMENTS),
+        "fields_checked":    len(field_check_results),
+        "total_issues":      total_issues,
+        "critical_issues":   critical_count,
+        "risk_score":        risk_score,
+        "extracted_documents": SAMPLE_DOCUMENTS,
+        "field_check_results": field_check_results,
+        "issues":            issues_flat,
+        "note": "This is a test run with sample data to verify the analysis system is working"
+    }
+
+    logger.info(f"[{shipment_id}] Test analysis complete. risk_score={risk_score}, issues={total_issues}")
+    return JSONResponse(content=report, status_code=200)
+
+
+# ==============================================================================
+# Single-document endpoints (unchanged from original, still useful for testing)
+# ==============================================================================
+
+@app.post("/api/v1/process", tags=["Processing"])
+async def process_single_document(
+    file: UploadFile = File(...),
+    ocr_language: str = "eng",
+    enhance_preprocessing: bool = True
+):
+    """Process a single PDF — OCR + extraction only (no cross-doc checking)."""
+    request_id = str(uuid.uuid4())
+    tmp_path = None
+    try:
+        if file.content_type not in ("application/pdf", "application/octet-stream"):
+            raise HTTPException(400, "Only PDF files are supported.")
+
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{request_id}_{file.filename}")
+        contents = await file.read()
+        with open(tmp_path, "wb") as f:
+            f.write(contents)
+
+        if len(contents) > 50 * 1024 * 1024:
+            raise HTTPException(400, "File exceeds 50 MB limit.")
+
+        raw_text_dict = (
+            ocr_engine.extract_text_enhanced(tmp_path, lang=ocr_language, preprocess=True)
+            if enhance_preprocessing
+            else ocr_engine.extract_text(tmp_path, lang=ocr_language)
+        )
+
+        extraction_results = document_extractor.extract_batch(raw_text_dict)
+
+        return JSONResponse(content={
+            "request_id":  request_id,
+            "filename":    file.filename,
+            "total_pages": len(raw_text_dict),
+            "results": [
+                document_extractor.to_dict(r)
+                for r in extraction_results.values()
+            ],
+            "timestamp": datetime.now().isoformat(),
+        }, status_code=200)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] {str(e)}", exc_info=True)
+        raise HTTPException(500, str(e))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+# ==============================================================================
+# Run
+# ==============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main_input:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
