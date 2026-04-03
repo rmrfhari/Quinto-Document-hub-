@@ -153,6 +153,62 @@ class DocumentClassifier:
         return best_type, best_score
 
 
+class SimpleFieldExtractor:
+    """
+    Simple keyword-based field extraction as fallback when regex fails
+    """
+    
+    # Map of field keywords to look for
+    FIELD_KEYWORDS = {
+        'shipper': ['shipper', 'from:', 'export', 'vendor', 'seller'],
+        'consignee': ['consignee', 'to:', 'import', 'buyer', 'bill to'],
+        'total_quantity': ['qty', 'quantity', 'units', 'pieces', 'total qty'],
+        'total_weight': ['total weight', 'gross weight', 'wgt', 'kg', 'lbs'],
+        'port_of_loading': ['port of loading', 'loading port', 'from port'],
+        'port_of_discharge': ['port of discharge', 'discharge port', 'to port'],
+        'hs_code': ['hs code', 'tariff code', 'hscode'],
+        'country_of_origin': ['country of origin', 'made in', 'origin'],
+        'total_amount': ['total amount', 'total value', 'invoice amount', 'total due'],
+        'incoterms': ['incoterms', 'cif', 'fob', 'exw', 'dap'],
+    }
+    
+    def extract_simple(self, raw_text: str) -> Dict[str, Any]:
+        """
+        Extract fields using simple keyword matching
+        Returns dict of field_name -> value
+        """
+        extracted = {}
+        text_lower = raw_text.lower()
+        lines = raw_text.split('\n')
+        
+        for field_name, keywords in self.FIELD_KEYWORDS.items():
+            for keyword in keywords:
+                keyword_lower = keyword.lower()
+                if keyword_lower in text_lower:
+                    # Find the line containing this keyword
+                    for i, line in enumerate(lines):
+                        if keyword_lower in line.lower():
+                            # Extract from this line or next few lines
+                            value_text = line
+                            # If keyword is at start, take the rest of the line
+                            if ':' in line:
+                                parts = line.split(':', 1)
+                                if len(parts) > 1:
+                                    value_text = parts[1].strip()
+                            
+                            # Limit to reasonable length and clean up
+                            value_text = value_text.replace(keyword, '', 1).strip()
+                            value_text = value_text.replace(':', '', 1).strip()
+                            
+                            if value_text and len(value_text) > 0:
+                                extracted[field_name] = value_text
+                                break
+                    if field_name in extracted:
+                        break
+        
+        return extracted
+
+
 class FieldExtractor:
     """
     Extracts specific fields from classified documents
@@ -161,51 +217,60 @@ class FieldExtractor:
     # Field extraction patterns for each document type
     EXTRACTION_PATTERNS = {
         DocumentType.COMMERCIAL_INVOICE: {
-            'invoice_number': r'(?:invoice\s*(?:no|number|#)?\s*[:=]?\s*)([A-Z0-9\-\/]+)',
-            'invoice_date': r'(?:invoice\s*date\s*[:=]?\s*)(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})',
-            'buyer': r'(?:bill\s*to[:\s]+)([\w\s&.,]+?)(?:\n|bill|ship)',
-            'seller': r'(?:from|seller|vendor)[:\s]+([\w\s&.,]+?)(?:\n|invoice)',
-            'total_amount': r'(?:total\s*(?:amount|due)?\s*[:=]?\s*)([0-9,]+\.?\d*)',
-            'currency': r'(?:currency|amount|total)\s*\(?\s*([A-Z]{3})?\s*\)?',
-            'tax': r'(?:tax|gst|vat)\s*[:=]?\s*([0-9,]+\.?\d*)',
-            'items': r'(?:(?:item|product|description)\s*[#:]?\s*)(.*?)(?:quantity|qty|unit)',
+            'invoice_number': r'(?:invoice\s*(?:no|number|#|ref)?\s*[:\s=]+)([A-Za-z0-9\-\/\.]+)',
+            'invoice_date': r'(?:invoice\s*date\s*[:\s=]+)(\d{1,2}[\s\-\/]\d{1,2}[\s\-\/]\d{2,4})',
+            'seller': r'(?:from|seller|vendor|shipper|exporter)[:\s=]+([^\n]{1,100}?)(?:\n|bill|consign)',
+            'buyer': r'(?:bill\s+to|buyer|consignee|importer)[:\s=]+([^\n]{1,100}?)(?:\n|bill|port)',
+            'total_amount': r'(?:total\s+(?:amount|due|value)?\s*[:\s=]+)(\$?\s*[0-9,]+\.?\d*)',
+            'total_quantity': r'(?:total\s+(?:qty|quantity|items|units|boxes)\s*[:\s=]+)([0-9,]+\.?\d*)',
+            'total_weight': r'(?:total\s+(?:weight|wgt)\s*[:\s=]+)([0-9,]+\.?\d*)\s*(?:kg|lbs?|mt|g)?',
+            'port_of_loading': r'(?:port\s+of\s+(?:loading|shipment|origin)\s*[:\s=]+)([A-Za-z\s,\-]{1,50}?)(?:\n|port)',
+            'port_of_discharge': r'(?:port\s+of\s+(?:discharge|destination)\s*[:\s=]+)([A-Za-z\s,\-]{1,50}?)(?:\n|final)',
+            'hs_code': r'(?:hs\s*code|tariff\s*code)\s*[:\s=]+([0-9]{4,10})',
+            'country_of_origin': r'(?:country\s+of\s+origin|manufactured\s+in)\s*[:\s=]+([A-Za-z\s,\-]+?)(?:\n|product)',
+            'incoterms': r'(?:incoterms?|terms\s+of\s+trade|shipping\s+terms)\s*[:\s=]+([A-Za-z0-9]{2,10})',
         },
         DocumentType.PACKING_LIST: {
-            'packing_list_number': r'(?:packing\s*list\s*(?:no|number)?\s*[:=]?\s*)([A-Z0-9\-\/]+)',
-            'contents': r'(?:contents?|description)\s*[:=]?\s*([\w\s,\.]+?)(?:\n|qty|quantity)',
-            'total_items': r'(?:total\s*(?:items?|qty|pieces?))\s*[:=]?\s*(\d+)',
-            'weight': r'(?:weight|wgt)\s*[:=]?\s*([0-9,]+\.?\d*)\s*(kg|lbs?|mt)?',
-            'dimensions': r'(?:dimension|size)\s*[:=]?\s*([\d,\.]+\s*x\s*[\d,\.]+\s*x\s*[\d,\.]+)',
-            'date_packed': r'(?:date\s*(?:packed|packing))\s*[:=]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})',
+            'packing_list_number': r'(?:packing\s+list\s+(?:no|number|ref)?\s*[:\s=]+)([A-Za-z0-9\-\/\.]+)',
+            'shipper': r'(?:shipper|from)\s*[:\s=]+([^\n]{1,100}?)(?:\n|consign)',
+            'consignee': r'(?:consignee|bill\s+to)\s*[:\s=]+([^\n]{1,100}?)(?:\n|contents?)',
+            'contents': r'(?:contents?|description|items?)\s*[:\s=]+([^\n]{1,150}?)(?:\n|qty)',
+            'total_quantity': r'(?:total\s+(?:items?|qty|pieces?|quantity|units|boxes)\s*[:\s=]+)([0-9,]+\.?\d*)',
+            'total_weight': r'(?:total\s+(?:weight|wgt)\s*[:\s=]+)([0-9,]+\.?\d*)\s*(?:kg|lbs?|mt|g)?',
+            'date_packed': r'(?:date\s+(?:packed|packing)\s*[:\s=]+)(\d{1,2}[\s\-\/]\d{1,2}[\s\-\/]\d{2,4})',
         },
         DocumentType.BILL_OF_LADING: {
-            'bol_number': r'(?:bill\s*of\s*lading|b\/l|bol)\s*(?:no|number)?\s*[:=]?\s*([A-Z0-9\-\/]+)',
-            'vessel_name': r'(?:vessel|ship|vessel\s*name)\s*[:=]?\s*([\w\s]+?)(?:\n|voyage)',
-            'voyage_number': r'(?:voyage|voyage\s*(?:no|number))\s*[:=]?\s*([A-Z0-9\-\/]+)',
-            'port_of_loading': r'(?:port\s*of\s*(?:loading|shipment))\s*[:=]?\s*([A-Z\s,]+?)(?:\n|port\s*of)',
-            'port_of_discharge': r'(?:port\s*of\s*(?:discharge|destination))\s*[:=]?\s*([A-Z\s,]+?)(?:\n|final)',
-            'shipper': r'(?:shipper)[:\s]+([\w\s&.,]+?)(?:\n|consignee)',
-            'consignee': r'(?:consignee)[:\s]+([\w\s&.,]+?)(?:\n|notify)',
+            'bol_number': r'(?:bill\s+of\s+lading|b\/l|bol)\s+(?:no|number|ref)?\s*[:\s=]+([A-Za-z0-9\-\/\.]+)',
+            'shipper': r'(?:shipper)\s*[:\s=]+([^\n]{1,100}?)(?:\n|consign)',
+            'consignee': r'(?:consignee)\s*[:\s=]+([^\n]{1,100}?)(?:\n|notify)',
+            'vessel_name': r'(?:vessel|ship|vessel\s+name)\s*[:\s=]+([A-Za-z0-9\s\-\.]{1,80}?)(?:\n|voyage)',
+            'voyage_number': r'(?:voyage|voyage\s+(?:no|number))\s*[:\s=]+([A-Za-z0-9\-\/\.]+)',
+            'port_of_loading': r'(?:port\s+of\s+(?:loading|shipment)\s*[:\s=]+)([A-Za-z\s,\-]{1,50}?)(?:\n|port)',
+            'port_of_discharge': r'(?:port\s+of\s+(?:discharge|destination)\s*[:\s=]+)([A-Za-z\s,\-]{1,50}?)(?:\n|final)',
+            'total_quantity': r'(?:total\s+(?:qty|quantity|items|containers?|units?|boxes)\s*[:\s=]+)([0-9,]+\.?\d*)',
+            'total_weight': r'(?:total\s+(?:weight|wgt)\s*[:\s=]+)([0-9,]+\.?\d*)\s*(?:kg|lbs?|mt|g)?',
+            'incoterms': r'(?:incoterms?|terms\s+of\s+trade)\s*[:\s=]+([A-Za-z0-9]{2,10})',
         },
         DocumentType.CERTIFICATE_OF_ORIGIN: {
-            'certificate_number': r'(?:certificate\s*(?:no|number))\s*[:=]?\s*([A-Z0-9\-\/]+)',
-            'exporter': r'(?:exporter)[:\s]+([\w\s&.,]+?)(?:\n|importer)',
-            'importer': r'(?:importer|buyer)[:\s]+([\w\s&.,]+?)(?:\n|country)',
-            'country_of_origin': r'(?:country\s*of\s*origin)\s*[:=]?\s*([A-Z\s,]+?)(?:\n|product)',
-            'issue_date': r'(?:issue\s*date|date\s*of\s*issue)\s*[:=]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})',
+            'certificate_number': r'(?:certificate\s+(?:no|number|ref)\s*[:\s=]+)([A-Za-z0-9\-\/\.]+)',
+            'exporter': r'(?:exporter|shipper)\s*[:\s=]+([^\n]{1,100}?)(?:\n|import)',
+            'importer': r'(?:importer|buyer|consignee)\s*[:\s=]+([^\n]{1,100}?)(?:\n|country)',
+            'country_of_origin': r'(?:country\s+of\s+origin)\s*[:\s=]+([A-Za-z\s,\-]+?)(?:\n|product)',
+            'issue_date': r'(?:issue\s+date|date\s+of\s+issue)\s*[:\s=]+(\d{1,2}[\s\-\/]\d{1,2}[\s\-\/]\d{2,4})',
         },
         DocumentType.CUSTOMS_DECLARATION: {
-            'declaration_number': r'(?:declaration|form)\s*(?:no|number)?\s*[:=]?\s*([A-Z0-9\-\/]+)',
-            'hs_code': r'(?:hs\s*code|tariff\s*code)\s*[:=]?\s*([0-9]{4,10})',
-            'total_value': r'(?:total\s*(?:value|amount))\s*[:=]?\s*([0-9,]+\.?\d*)',
-            'declarant_name': r'(?:declarant|declaration\s*by)\s*[:=]?\s*([\w\s&.,]+?)(?:\n|date)',
-            'declaration_date': r'(?:declaration\s*date|date)\s*[:=]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})',
+            'declaration_number': r'(?:declaration|form)\s+(?:no|number|ref)?\s*[:\s=]+([A-Za-z0-9\-\/\.]+)',
+            'hs_code': r'(?:hs\s*code|tariff\s*code)\s*[:\s=]+([0-9]{4,10})',
+            'total_value': r'(?:total\s+(?:value|amount)\s*[:\s=]+)(\$?\s*[0-9,]+\.?\d*)',
+            'country_of_origin': r'(?:country\s+of\s+origin)\s*[:\s=]+([A-Za-z\s,\-]+?)(?:\n|product)',
+            'incoterms': r'(?:incoterms?|terms)\s*[:\s=]+([A-Za-z0-9]{2,10})',
+            'declaration_date': r'(?:declaration\s+date|date)\s*[:\s=]+(\d{1,2}[\s\-\/]\d{1,2}[\s\-\/]\d{2,4})',
         }
     }
     
     def extract_fields(self, raw_text: str, doc_type: DocumentType) -> Dict[str, Any]:
         """
-        Extract fields based on document type
+        Extract fields based on document type with multiple fallback strategies
         
         Args:
             raw_text (str): Raw OCR text
@@ -227,11 +292,35 @@ class FieldExtractor:
                 match = re.search(pattern, raw_text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
                 if match:
                     value = match.group(1).strip() if match.groups() else match.group(0).strip()
-                    extracted[field_name] = self._normalize_field(field_name, value)
-                    logger.debug(f"Extracted {field_name}: {extracted[field_name]}")
+                    normalized = self._normalize_field(field_name, value)
+                    if normalized is not None:
+                        extracted[field_name] = normalized
+                        logger.debug(f"Extracted {field_name}: {normalized}")
             
             except Exception as e:
                 logger.error(f"Error extracting field {field_name}: {str(e)}")
+        
+        # Fallback: For critical fields that might have been missed, try simpler patterns
+        critical_fields = {
+            'shipper': r'shipper[:\s=]+([^\n]+)',
+            'consignee': r'consignee[:\s=]+([^\n]+)',
+            'total_quantity': r'(?:qty|quantity|unit|pieces?)\s*[:\s=]+(\d+)',
+            'total_weight': r'weight[:\s=]+([0-9,\.]+)',
+            'country_of_origin': r'(?:origin|country)[:\s=]+([A-Za-z\s,]+?)(?:\n|$)',
+        }
+        
+        for field_name, simple_pattern in critical_fields.items():
+            if field_name not in extracted:  # Only try fallback if not already extracted
+                try:
+                    match = re.search(simple_pattern, raw_text, re.IGNORECASE)
+                    if match:
+                        value = match.group(1).strip()
+                        normalized = self._normalize_field(field_name, value)
+                        if normalized is not None:
+                            extracted[field_name] = normalized
+                            logger.debug(f"Fallback extracted {field_name}: {normalized}")
+                except Exception as e:
+                    pass
         
         return extracted
     
@@ -244,26 +333,42 @@ class FieldExtractor:
             value (str): Raw field value
             
         Returns:
-            Any: Normalized value
+            Any: Normalized value (None if empty, numeric for amounts, string for text)
         """
         try:
-            # Normalize numbers
-            if any(x in field_name for x in ['amount', 'total', 'weight', 'price', 'qty', 'quantity']):
-                # Remove currency symbols and convert to float
-                value = re.sub(r'[^\d.,\-]', '', value)
-                value = value.replace(',', '')
-                return float(value) if value else 0.0
+            # Skip empty/whitespace values — return None instead of 0 or empty string
+            if not value or not value.strip():
+                return None
+            
+            original_value = value.strip()
+            
+            # Normalize numbers (quantities, amounts, weights)
+            if any(x in field_name.lower() for x in ['amount', 'total', 'weight', 'price', 'qty', 'quantity', 'value']):
+                # Remove currency symbols, words, and convert to float
+                cleaned = re.sub(r'[^\d.,\-]', '', original_value)
+                cleaned = cleaned.replace(',', '').strip()
+                if cleaned and cleaned != '-':
+                    try:
+                        numeric_val = float(cleaned)
+                        # Return None if it's actually zero (which means extraction failed), but keep small values
+                        return numeric_val if numeric_val != 0 or 'zero' in value.lower() else None
+                    except ValueError:
+                        return None
+                return None
             
             # Normalize dates
-            if any(x in field_name for x in ['date', 'time']):
-                return self._parse_date(value)
+            if any(x in field_name.lower() for x in ['date', 'time']):
+                parsed = self._parse_date(original_value)
+                return parsed if parsed and parsed.strip() else None
             
-            # Keep as string
-            return value.strip()
+            # Keep as string - normalize whitespace
+            if len(original_value) > 3:  # Only return if it's more than just punctuation
+                return original_value
+            return None
         
         except Exception as e:
             logger.warning(f"Error normalizing field {field_name}: {str(e)}")
-            return value
+            return None  # Return None on parse error
     
     def _parse_date(self, date_str: str) -> str:
         """
@@ -354,6 +459,7 @@ class DocumentExtractor:
     def __init__(self):
         self.classifier = DocumentClassifier()
         self.field_extractor = FieldExtractor()
+        self.simple_extractor = SimpleFieldExtractor()
         self.validator = DocumentValidator()
     
     def extract(self, raw_text: str, page_num: int = 0) -> ExtractionResult:
@@ -372,11 +478,22 @@ class DocumentExtractor:
             doc_type, classification_confidence = self.classifier.classify(raw_text)
             logger.info(f"Page {page_num}: Classified as {doc_type.value}")
             
-            # Step 2: Extract fields
+            # Step 2: Extract fields (regex-based)
             extracted_fields = self.field_extractor.extract_fields(raw_text, doc_type)
-            logger.info(f"Page {page_num}: Extracted {len(extracted_fields)} fields")
+            logger.info(f"Page {page_num}: Extracted {len(extracted_fields)} fields with regex")
             
-            # Step 3: Validate
+            # Step 3: Fallback - Use simple keyword extraction to fill gaps
+            if len(extracted_fields) < 3:  # If regex extraction didn't find much
+                simple_fields = self.simple_extractor.extract_simple(raw_text)
+                # Add simple fields that weren't found by regex
+                for field_name, value in simple_fields.items():
+                    if field_name not in extracted_fields:
+                        normalized_val = self.field_extractor._normalize_field(field_name, value)
+                        if normalized_val is not None:
+                            extracted_fields[field_name] = normalized_val
+                logger.info(f"Page {page_num}: Added {len([f for f in simple_fields if f not in extracted_fields])} fields from simple extraction")
+            
+            # Step 4: Validate
             is_valid, warnings = self.validator.validate(doc_type, extracted_fields)
             
             # Calculate quality score (0-100)
