@@ -1,4 +1,4 @@
-# Quinto Document Hub  
+# Quinto Document Hub
 ### AI-Powered Trade Document Validation
 
 Quinto is a full-stack, AI-driven application that automates the classification, extraction, and cross-validation of international trade shipping documents.
