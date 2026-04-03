@@ -1,133 +1,362 @@
 """
-FastAPI Application
-Main API orchestrating file uploads, OCR processing, document extraction, and JSON responses
-Endpoints for single/batch PDF processing with complete extraction pipeline
+Quinto — FastAPI Backend
+Full pipeline: PDF upload → OCR → extraction → cross-doc field checking → output.html
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-import tempfile
-import os
-import logging
-from typing import List, Dict, Optional, Any
-from pathlib import Path
-import json
+from fastapi.staticfiles import StaticFiles
+import tempfile, os, logging, json, uuid
+from typing import List, Dict, Any
 from datetime import datetime
-import uuid
+from pathlib import Path
 
-# Import custom modules
+# ── Local modules ──────────────────────────────────────────────────────────────
 from ocr_engine import OCREngine, get_ocr_engine
 from extractor import DocumentExtractor, get_extractor, ExtractionResult
+from field_checker import analyze_all_cross_doc_fields, MASTER_REGISTRY, print_report
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+# ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Document Processing API",
-    description="OCR and document extraction pipeline for international trade documents",
-    version="1.0.0"
+    title="Quinto Document Validation API",
+    description="OCR → extraction → cross-doc inconsistency pipeline for trade documents",
+    version="2.0.0"
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# Global instances
-ocr_engine = None
-document_extractor = None
+# Serve the two HTML pages as static files if they live next to this script.
+# landingpage.html  →  /
+# output.html       →  /output.html
+STATIC_DIR = Path(__file__).parent
+if (STATIC_DIR / "landingpage.html").exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# In-memory storage for processing results (for demonstration)
-# In production, use Redis or database
-processing_results = {}
+# ── Global singletons ──────────────────────────────────────────────────────────
+ocr_engine: OCREngine = None
+document_extractor: DocumentExtractor = None
+
+# In-memory store for validation results keyed by shipment_id
+validation_store: Dict[str, Any] = {}
 
 
-# ============================================================================
-# Startup/Shutdown Events
-# ============================================================================
-
+# ── Startup ────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
-    """Initialize OCR engine and extractor on startup"""
     global ocr_engine, document_extractor
-    
-    try:
-        logger.info("Initializing OCR Engine...")
-        ocr_engine = get_ocr_engine(dpi=300)
-        
-        logger.info("Initializing Document Extractor...")
-        document_extractor = get_extractor()
-        
-        logger.info("Application startup completed successfully")
-    
-    except Exception as e:
-        logger.error(f"Error during startup: {str(e)}")
-        raise
+    logger.info("Initialising OCR Engine …")
+    ocr_engine = get_ocr_engine(dpi=300)
+    logger.info("Initialising Document Extractor …")
+    document_extractor = get_extractor()
+    logger.info("Quinto backend ready.")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
-    logger.info("Application shutting down")
+    logger.info("Quinto backend shutting down.")
 
 
-# ============================================================================
-# Health Check Endpoints
-# ============================================================================
-
-@app.get("/health", tags=["Health"])
+# ── Health ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
 async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+# ── Serve landing page ─────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def serve_landing():
+    """Serve landingpage.html at root."""
+    lp = STATIC_DIR / "landingpage.html"
+    if lp.exists():
+        return HTMLResponse(content=lp.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>landingpage.html not found next to main_input.py</h1>", status_code=404)
+
+
+# ── Serve output page ──────────────────────────────────────────────────────────
+@app.get("/output.html", response_class=HTMLResponse)
+async def serve_output():
+    """Serve output.html (static template — used before a real report is ready)."""
+    op = STATIC_DIR / "output.html"
+    if op.exists():
+        return HTMLResponse(content=op.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>output.html not found</h1>", status_code=404)
+
+
+# ==============================================================================
+# CORE ENDPOINT: /api/v1/validate-shipment
+# Accepts 1-5 PDF files, runs the full pipeline, returns structured report.
+# ==============================================================================
+
+@app.post("/api/v1/validate-shipment", tags=["Validation"])
+async def validate_shipment(
+    files: List[UploadFile] = File(...),
+    ocr_language: str = "eng",
+    enhance_preprocessing: bool = True
+):
     """
-    Health check endpoint
-    
-    Returns:
-        Dict: Status and timestamp
+    Full Quinto pipeline:
+      1. Receive PDF files (up to 5 trade documents)
+      2. OCR each PDF  →  raw text per page
+      3. Classify + extract structured fields  (extractor.py)
+      4. Run cross-document field consistency checks  (field_checker.py)
+      5. Return JSON validation report + HTML-ready payload
+
+    The JSON response is everything output.html needs to render the report.
     """
+    shipment_id = str(uuid.uuid4())[:8].upper()
+    logger.info(f"[{shipment_id}] Received {len(files)} file(s)")
+
+    temp_paths = []
+
+    try:
+        # ── Step 1 & 2: Save files → OCR ──────────────────────────────────────
+        ocr_results: Dict[str, Dict[int, str]] = {}   # filename → {page: text}
+
+        for upload in files:
+            if upload.content_type not in ("application/pdf", "application/octet-stream"):
+                raise HTTPException(400, f"'{upload.filename}' is not a PDF.")
+
+            tmp_path = os.path.join(tempfile.gettempdir(),
+                                    f"{shipment_id}_{upload.filename}")
+            contents = await upload.read()
+            if len(contents) > 50 * 1024 * 1024:
+                raise HTTPException(400, f"'{upload.filename}' exceeds 50 MB limit.")
+
+            with open(tmp_path, "wb") as f:
+                f.write(contents)
+            temp_paths.append(tmp_path)
+
+            logger.info(f"[{shipment_id}] OCR → {upload.filename}")
+            if enhance_preprocessing:
+                ocr_results[upload.filename] = ocr_engine.extract_text_enhanced(
+                    tmp_path, lang=ocr_language, preprocess=True)
+            else:
+                ocr_results[upload.filename] = ocr_engine.extract_text(
+                    tmp_path, lang=ocr_language)
+
+        # ── Step 3: Extract structured fields from each document ───────────────
+        # We collapse all pages of a document into one text blob per file,
+        # then classify + extract once per file.
+        extracted_documents = []   # list of dicts ready for field_checker.py
+
+        for filename, page_dict in ocr_results.items():
+            full_text = "\n".join(page_dict.values())
+            result: ExtractionResult = document_extractor.extract(full_text)
+
+            # Map extractor's DocumentType enum value → human-readable label
+            # used as "doc_type" key expected by field_checker's MASTER_REGISTRY
+            DOC_TYPE_MAP = {
+                "commercial_invoice":   "Commercial Invoice",
+                "packing_list":         "Packing List",
+                "bill_of_lading":       "Bill of Lading",
+                "certificate_of_origin":"Certificate of Origin",
+                "customs_declaration":  "Customs Declaration",
+                "unknown":              filename,   # fallback: use filename
+            }
+            doc_type_label = DOC_TYPE_MAP.get(result.document_type, filename)
+
+            extracted_documents.append({
+                "doc_type":  doc_type_label,
+                "filename":  filename,
+                "fields":    result.extracted_fields,
+                "confidence": result.confidence,
+                "quality_score": result.quality_score,
+                "warnings":  result.warnings,
+            })
+
+            logger.info(
+                f"[{shipment_id}] {filename} → {doc_type_label} "
+                f"(confidence={result.confidence:.2%}, fields={len(result.extracted_fields)})"
+            )
+            # DEBUG: Log what was actually extracted
+            for fname, fval in result.extracted_fields.items():
+                logger.info(f"  {fname} = {fval}")
+
+        # ── Step 4: Cross-document field consistency check (Gemini) ───────────
+        logger.info(f"[{shipment_id}] Running cross-doc field checks via Gemini …")
+        
+        # DEBUG: Log what's being sent to field_checker
+        logger.info(f"[{shipment_id}] Extracted Documents Summary:")
+        for i, doc in enumerate(extracted_documents):
+            logger.info(f"  Doc {i}: {doc['doc_type']} - {len(doc['fields'])} fields")
+            for fname, fval in doc['fields'].items():
+                logger.info(f"    {fname}: {fval}")
+        
+        field_check_results = analyze_all_cross_doc_fields(
+            extracted_documents, MASTER_REGISTRY
+        )
+        
+        # DEBUG: Log what came back
+        logger.info(f"[{shipment_id}] Field check results: {len(field_check_results)} fields analyzed")
+        for field_name, result in field_check_results.items():
+            has_issues = result.get("inconsistencies_found", False)
+            severity = result.get("overall_severity", "UNKNOWN")
+            issues_count = len(result.get("issues", []))
+            logger.info(f"  - {field_name}: inconsistencies={has_issues}, severity={severity}, issues={issues_count}")
+            if "error" in result:
+                logger.warning(f"    ERROR: {result['error']}")
+
+        # ── Step 5: Build unified report ──────────────────────────────────────
+        issues_flat = []
+        total_issues = 0
+        critical_count = 0
+
+        for field_name, check in field_check_results.items():
+            if check.get("inconsistencies_found"):
+                for issue in check.get("issues", []):
+                    total_issues += 1
+                    sev = issue.get("severity", "LOW")
+                    if sev == "CRITICAL":
+                        critical_count += 1
+                    issues_flat.append({
+                        "field":            field_name,
+                        "type":             issue.get("type"),
+                        "severity":         sev,
+                        "documents":        issue.get("documents_involved", []),
+                        "details":          issue.get("details"),
+                        "values":           issue.get("values", {}),
+                        "recommendation":   issue.get("recommendation"),
+                    })
+
+        # Compute a simple risk score (0-100)
+        sev_weights = {"CRITICAL": 20, "HIGH": 10, "MEDIUM": 5, "LOW": 2}
+        raw_score = sum(sev_weights.get(i["severity"], 0) for i in issues_flat)
+        risk_score = min(100, raw_score)
+
+        report = {
+            "shipment_id":       f"TRD-{datetime.now().year}-{shipment_id}",
+            "processed_at":      datetime.now().isoformat(),
+            "documents_received": len(extracted_documents),
+            "fields_checked":    len(field_check_results),
+            "total_issues":      total_issues,
+            "critical_issues":   critical_count,
+            "risk_score":        risk_score,
+            "extracted_documents": extracted_documents,
+            "field_check_results": field_check_results,
+            "issues":            issues_flat,
+        }
+
+        # Store for later retrieval
+        validation_store[shipment_id] = report
+
+        logger.info(
+            f"[{shipment_id}] Done. risk_score={risk_score}, issues={total_issues}"
+        )
+        return JSONResponse(content=report, status_code=200)
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"[{shipment_id}] Pipeline error: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"Pipeline error: {str(e)}")
+
+    finally:
+        # Always clean up temp files
+        for p in temp_paths:
+            if os.path.exists(p):
+                os.remove(p)
+
+
+# ==============================================================================
+# CONVENIENCE: retrieve a stored report
+# ==============================================================================
+
+@app.get("/api/v1/report/{shipment_id}", tags=["Results"])
+async def get_report(shipment_id: str):
+    """Retrieve a previously computed validation report by shipment ID."""
+    if shipment_id not in validation_store:
+        raise HTTPException(404, f"No report found for shipment ID: {shipment_id}")
+    return validation_store[shipment_id]
+
+
+@app.get("/api/v1/reports", tags=["Results"])
+async def list_reports():
+    """List all stored report IDs."""
     return {
-        "status": "healthy",
+        "total": len(validation_store),
+        "shipment_ids": list(validation_store.keys()),
         "timestamp": datetime.now().isoformat(),
-        "version": "1.0.0"
     }
 
 
-@app.get("/info", tags=["Info"])
-async def app_info():
-    """
-    Get application information
+# ==============================================================================
+# TEST ENDPOINT: Debug with sample data
+# ==============================================================================
+
+@app.get("/api/v1/test-analysis", tags=["Testing"])
+async def test_analysis():
+    """Run analysis on sample documents to test if the system is working."""
+    shipment_id = "TEST-SAMPLE-001"
+    logger.info(f"[{shipment_id}] Running test analysis with sample data...")
     
-    Returns:
-        Dict: API information and capabilities
-    """
-    return {
-        "name": "Document Processing API",
-        "version": "1.0.0",
-        "description": "OCR and document extraction for trade documents",
-        "supported_document_types": [
-            "commercial_invoice",
-            "packing_list",
-            "bill_of_lading",
-            "certificate_of_origin",
-            "customs_declaration"
-        ],
-        "max_file_size_mb": 50,
-        "supported_formats": ["PDF"],
-        "ocr_languages": ["eng", "fra", "deu", "ita", "spa"]
+    # Import sample documents
+    from field_checker import SAMPLE_DOCUMENTS
+    
+    # Run cross-document field checking
+    field_check_results = analyze_all_cross_doc_fields(
+        SAMPLE_DOCUMENTS, MASTER_REGISTRY
+    )
+    
+    logger.info(f"[{shipment_id}] Field check results: {len(field_check_results)} fields analyzed")
+
+    # Build issues flat
+    issues_flat = []
+    total_issues = 0
+    critical_count = 0
+
+    for field_name, check in field_check_results.items():
+        if check.get("inconsistencies_found"):
+            for issue in check.get("issues", []):
+                total_issues += 1
+                sev = issue.get("severity", "LOW")
+                if sev == "CRITICAL":
+                    critical_count += 1
+                issues_flat.append({
+                    "field":            field_name,
+                    "type":             issue.get("type"),
+                    "severity":         sev,
+                    "documents":        issue.get("documents_involved", []),
+                    "details":          issue.get("details"),
+                    "values":           issue.get("values", {}),
+                    "recommendation":   issue.get("recommendation"),
+                })
+
+    # Compute risk score
+    sev_weights = {"CRITICAL": 20, "HIGH": 10, "MEDIUM": 5, "LOW": 2}
+    raw_score = sum(sev_weights.get(i["severity"], 0) for i in issues_flat)
+    risk_score = min(100, raw_score)
+
+    report = {
+        "shipment_id":       f"TRD-TEST-{datetime.now().year}-{shipment_id}",
+        "processed_at":      datetime.now().isoformat(),
+        "documents_received": len(SAMPLE_DOCUMENTS),
+        "fields_checked":    len(field_check_results),
+        "total_issues":      total_issues,
+        "critical_issues":   critical_count,
+        "risk_score":        risk_score,
+        "extracted_documents": SAMPLE_DOCUMENTS,
+        "field_check_results": field_check_results,
+        "issues":            issues_flat,
+        "note": "This is a test run with sample data to verify the analysis system is working"
     }
 
+    logger.info(f"[{shipment_id}] Test analysis complete. risk_score={risk_score}, issues={total_issues}")
+    return JSONResponse(content=report, status_code=200)
 
-# ============================================================================
-# Single File Processing
-# ============================================================================
+
+# ==============================================================================
+# Single-document endpoints (unchanged from original, still useful for testing)
+# ==============================================================================
 
 @app.post("/api/v1/process", tags=["Processing"])
 async def process_single_document(
@@ -135,490 +364,54 @@ async def process_single_document(
     ocr_language: str = "eng",
     enhance_preprocessing: bool = True
 ):
-    """
-    Process a single PDF document with complete extraction pipeline
-    
-    Args:
-        file (UploadFile): PDF file to process
-        ocr_language (str): OCR language code (default: 'eng')
-        enhance_preprocessing (bool): Enable image preprocessing
-        
-    Returns:
-        Dict: Processing result with extracted fields
-        
-    Raises:
-        HTTPException: 400 for invalid file, 500 for processing errors
-    """
+    """Process a single PDF — OCR + extraction only (no cross-doc checking)."""
     request_id = str(uuid.uuid4())
-    
+    tmp_path = None
     try:
-        # Validate file
-        if file.content_type != 'application/pdf':
-            logger.warning(f"[{request_id}] Invalid file type: {file.content_type}")
-            raise HTTPException(
-                status_code=400,
-                detail="Only PDF files are supported"
-            )
-        
-        # Save uploaded file to temp location
-        temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, f"{request_id}_{file.filename}")
-        
-        logger.info(f"[{request_id}] Received file: {file.filename}")
-        
-        # Write file to disk
-        with open(temp_file_path, "wb") as temp_file:
-            contents = await file.read()
-            temp_file.write(contents)
-            file_size_mb = len(contents) / (1024 * 1024)
-            logger.info(f"[{request_id}] File size: {file_size_mb:.2f} MB")
-        
-        if file_size_mb > 50:
-            os.remove(temp_file_path)
-            raise HTTPException(
-                status_code=400,
-                detail="File size exceeds 50 MB limit"
-            )
-        
-        # OCR Processing
-        logger.info(f"[{request_id}] Starting OCR processing...")
-        if enhance_preprocessing:
-            raw_text_dict = ocr_engine.extract_text_enhanced(
-                temp_file_path,
-                lang=ocr_language,
-                preprocess=True
-            )
-        else:
-            raw_text_dict = ocr_engine.extract_text(
-                temp_file_path,
-                lang=ocr_language
-            )
-        
-        # Document Extraction
-        logger.info(f"[{request_id}] Starting document extraction...")
+        if file.content_type not in ("application/pdf", "application/octet-stream"):
+            raise HTTPException(400, "Only PDF files are supported.")
+
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{request_id}_{file.filename}")
+        contents = await file.read()
+        with open(tmp_path, "wb") as f:
+            f.write(contents)
+
+        if len(contents) > 50 * 1024 * 1024:
+            raise HTTPException(400, "File exceeds 50 MB limit.")
+
+        raw_text_dict = (
+            ocr_engine.extract_text_enhanced(tmp_path, lang=ocr_language, preprocess=True)
+            if enhance_preprocessing
+            else ocr_engine.extract_text(tmp_path, lang=ocr_language)
+        )
+
         extraction_results = document_extractor.extract_batch(raw_text_dict)
-        
-        # Prepare response
-        response_data = {
-            "request_id": request_id,
-            "filename": file.filename,
-            "processing_status": "completed",
-            "ocr_language": ocr_language,
+
+        return JSONResponse(content={
+            "request_id":  request_id,
+            "filename":    file.filename,
             "total_pages": len(raw_text_dict),
-            "extraction_results": [
-                document_extractor.to_dict(result)
-                for result in extraction_results.values()
+            "results": [
+                document_extractor.to_dict(r)
+                for r in extraction_results.values()
             ],
-            "processing_timestamp": datetime.now().isoformat()
-        }
-        
-        # Store results
-        processing_results[request_id] = response_data
-        
-        # Cleanup temp file
-        os.remove(temp_file_path)
-        
-        logger.info(f"[{request_id}] Processing completed successfully")
-        
-        return JSONResponse(
-    content={
-        "extraction_results": [
-            document_extractor.to_dict(result)
-            for result in extraction_results.values()
-        ]
-    },
-    status_code=200
-)
-    
+            "timestamp": datetime.now().isoformat(),
+        }, status_code=200)
+
     except HTTPException:
         raise
-    
     except Exception as e:
-        logger.error(f"[{request_id}] Error processing document: {str(e)}", exc_info=True)
-        
-        # Cleanup on error
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing document: {str(e)}"
-        )
+        logger.error(f"[{request_id}] {str(e)}", exc_info=True)
+        raise HTTPException(500, str(e))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
-# ============================================================================
-# Batch Processing
-# ============================================================================
-
-@app.post("/api/v1/process-batch", tags=["Processing"])
-async def process_batch_documents(
-    files: List[UploadFile] = File(...),
-    ocr_language: str = "eng"
-):
-    """
-    Process multiple PDF documents in batch
-    
-    Args:
-        files (List[UploadFile]): List of PDF files to process
-        ocr_language (str): OCR language code
-        
-    Returns:
-        Dict: Batch processing results
-        
-    Raises:
-        HTTPException: For validation or processing errors
-    """
-    request_id = str(uuid.uuid4())
-    batch_results = []
-    errors = []
-    
-    try:
-        logger.info(f"[{request_id}] Starting batch processing for {len(files)} files")
-        
-        if len(files) == 0:
-            raise HTTPException(status_code=400, detail="No files provided")
-        
-        if len(files) > 10:
-            raise HTTPException(
-                status_code=400,
-                detail="Maximum 10 files per batch"
-            )
-        
-        # Process each file
-        for idx, file in enumerate(files):
-            try:
-                logger.info(f"[{request_id}] Processing file {idx + 1}/{len(files)}: {file.filename}")
-                
-                # Validate file type
-                if file.content_type != 'application/pdf':
-                    errors.append({
-                        "filename": file.filename,
-                        "error": "Invalid file type. Only PDF supported."
-                    })
-                    continue
-                
-                # Save temp file
-                temp_dir = tempfile.gettempdir()
-                temp_file_path = os.path.join(
-                    temp_dir,
-                    f"{request_id}_{idx}_{file.filename}"
-                )
-                
-                with open(temp_file_path, "wb") as temp_file:
-                    contents = await file.read()
-                    temp_file.write(contents)
-                
-                # Process
-                raw_text_dict = ocr_engine.extract_text(temp_file_path, lang=ocr_language)
-                extraction_results = document_extractor.extract_batch(raw_text_dict)
-                
-                batch_results.append({
-                    "filename": file.filename,
-                    "status": "success",
-                    "pages": len(raw_text_dict),
-                    "results": [
-                        document_extractor.to_dict(result)
-                        for result in extraction_results.values()
-                    ]
-                })
-                
-                # Cleanup
-                os.remove(temp_file_path)
-            
-            except Exception as e:
-                logger.error(f"[{request_id}] Error processing {file.filename}: {str(e)}")
-                errors.append({
-                    "filename": file.filename,
-                    "error": str(e)
-                })
-        
-        response_data = {
-            "request_id": request_id,
-            "total_files": len(files),
-            "successful": len(batch_results),
-            "failed": len(errors),
-            "processing_results": batch_results,
-            "errors": errors,
-            "processing_timestamp": datetime.now().isoformat()
-        }
-        
-        processing_results[request_id] = response_data
-        logger.info(f"[{request_id}] Batch processing completed")
-        
-        return JSONResponse(content=response_data, status_code=200)
-    
-    except HTTPException:
-        raise
-    
-    except Exception as e:
-        logger.error(f"[{request_id}] Batch processing error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Batch processing error: {str(e)}"
-        )
-
-
-# ============================================================================
-# Results Retrieval
-# ============================================================================
-
-@app.get("/api/v1/results/{request_id}", tags=["Results"])
-async def get_results(request_id: str):
-    """
-    Retrieve processing results by request ID
-    
-    Args:
-        request_id (str): Request ID from processing endpoint
-        
-    Returns:
-        Dict: Processing results
-        
-    Raises:
-        HTTPException: 404 if results not found
-    """
-    if request_id not in processing_results:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No results found for request ID: {request_id}"
-        )
-    
-    logger.info(f"Retrieved results for request: {request_id}")
-    return processing_results[request_id]
-
-
-@app.get("/api/v1/results", tags=["Results"])
-async def list_results():
-    """
-    List all available processing results
-    
-    Returns:
-        Dict: Summary of all results
-    """
-    return {
-        "total_requests": len(processing_results),
-        "request_ids": list(processing_results.keys()),
-        "timestamp": datetime.now().isoformat()
-    }
-
-
-# ============================================================================
-# Advanced Endpoints
-# ============================================================================
-
-@app.post("/api/v1/extract-fields", tags=["Extraction"])
-async def extract_specific_fields(
-    file: UploadFile = File(...),
-    field_names: Optional[List[str]] = None,
-    ocr_language: str = "eng"
-):
-    """
-    Extract specific fields from a document
-    
-    Args:
-        file (UploadFile): PDF file
-        field_names (Optional[List[str]]): Specific fields to extract
-        ocr_language (str): OCR language code
-        
-    Returns:
-        Dict: Extracted fields matching the request
-    """
-    request_id = str(uuid.uuid4())
-    
-    try:
-        if file.content_type != 'application/pdf':
-            raise HTTPException(status_code=400, detail="Only PDF files supported")
-        
-        temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, f"{request_id}_{file.filename}")
-        
-        with open(temp_file_path, "wb") as temp_file:
-            contents = await file.read()
-            temp_file.write(contents)
-        
-        # OCR and Extraction
-        raw_text_dict = ocr_engine.extract_text(temp_file_path, lang=ocr_language)
-        extraction_results = document_extractor.extract_batch(raw_text_dict)
-        
-        # Filter fields if requested
-        filtered_results = []
-        for result in extraction_results.values():
-            result_dict = document_extractor.to_dict(result)
-            
-            if field_names:
-                filtered_fields = {
-                    k: v for k, v in result_dict['extracted_fields'].items()
-                    if k in field_names
-                }
-                result_dict['extracted_fields'] = filtered_fields
-            
-            filtered_results.append(result_dict)
-        
-        response_data = {
-            "request_id": request_id,
-            "filename": file.filename,
-            "document_type": extraction_results[0].document_type,
-            "fields_requested": field_names if field_names else "all",
-            "extraction_results": filtered_results,
-            "extraction_timestamp": datetime.now().isoformat()
-        }
-        
-        os.remove(temp_file_path)
-        
-        return JSONResponse(content=response_data, status_code=200)
-    
-    except HTTPException:
-        raise
-    
-    except Exception as e:
-        logger.error(f"[{request_id}] Error extracting fields: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# Document Type Detection
-# ============================================================================
-
-@app.post("/api/v1/detect-type", tags=["Detection"])
-async def detect_document_type(
-    file: UploadFile = File(...),
-    ocr_language: str = "eng"
-):
-    """
-    Detect document type without full extraction
-    
-    Args:
-        file (UploadFile): PDF file
-        ocr_language (str): OCR language code
-        
-    Returns:
-        Dict: Document type and confidence score
-    """
-    request_id = str(uuid.uuid4())
-    
-    try:
-        if file.content_type != 'application/pdf':
-            raise HTTPException(status_code=400, detail="Only PDF files supported")
-        
-        temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, f"{request_id}_{file.filename}")
-        
-        with open(temp_file_path, "wb") as temp_file:
-            contents = await file.read()
-            temp_file.write(contents)
-        
-        # OCR only
-        raw_text_dict = ocr_engine.extract_text(temp_file_path, lang=ocr_language)
-        
-        # Classify only
-        detection_results = []
-        for page_num, text in raw_text_dict.items():
-            doc_type, confidence = document_extractor.classifier.classify(text)
-            detection_results.append({
-                "page": page_num,
-                "document_type": doc_type.value,
-                "confidence": confidence
-            })
-        
-        response_data = {
-            "request_id": request_id,
-            "filename": file.filename,
-            "total_pages": len(raw_text_dict),
-            "detection_results": detection_results,
-            "primary_type": detection_results[0]['document_type'] if detection_results else "unknown",
-            "detection_timestamp": datetime.now().isoformat()
-        }
-        
-        os.remove(temp_file_path)
-        
-        return JSONResponse(content=response_data, status_code=200)
-    
-    except HTTPException:
-        raise
-    
-    except Exception as e:
-        logger.error(f"[{request_id}] Error detecting document type: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# Root and 404 Handling
-# ============================================================================
-
-@app.get("/", tags=["Root"])
-async def root():
-    """Root endpoint with API documentation"""
-    return {
-        "message": "Document Processing API",
-        "version": "1.0.0",
-        "documentation": "/docs",
-        "openapi_schema": "/openapi.json"
-    }
-
-
-@app.get("/docs", tags=["Documentation"])
-async def get_docs():
-    """API documentation"""
-    return {
-        "endpoints": {
-            "health": "GET /health",
-            "info": "GET /info",
-            "process": "POST /api/v1/process",
-            "process_batch": "POST /api/v1/process-batch",
-            "detect_type": "POST /api/v1/detect-type",
-            "extract_fields": "POST /api/v1/extract-fields",
-            "get_results": "GET /api/v1/results/{request_id}",
-            "list_results": "GET /api/v1/results"
-        },
-        "documentation_url": "http://localhost:8000/docs"
-    }
-
-
-# ============================================================================
-# Error Handlers
-# ============================================================================
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    """Custom HTTP exception handler"""
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": True,
-            "status_code": exc.status_code,
-            "detail": exc.detail,
-            "timestamp": datetime.now().isoformat()
-        }
-    )
-
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    """General exception handler"""
-    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": True,
-            "status_code": 500,
-            "detail": "Internal server error",
-            "timestamp": datetime.now().isoformat()
-        }
-    )
-
-
-# ============================================================================
-# Run Application
-# ============================================================================
+# ==============================================================================
+# Run
+# ==============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # Run FastAPI application
-    # For production, use: gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info",
-        reload=False
-    )
+    uvicorn.run("main_input:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
