@@ -213,6 +213,13 @@
                 markUploaded(index) { this.documents[index].uploaded = true; },
                 startAnalysis() {
                     this.loading = true;
+
+                    // Ping your live ngrok backend!
+                    fetch('https://anthological-sonic-eric.ngrok-free.dev')
+                        .then(response => console.log("Successfully connected to backend!"))
+                        .catch(error => console.error("Connection error:", error));
+
+                    // Move to the next page after 1.5 seconds
                     setTimeout(() => {
                         window.location.href = 'output.html';
                     }, 1500);
